@@ -1,5 +1,7 @@
 # nextcloud-aio-stack
 
+Репозиторий: [github.com/mihanic89/nextcloud-aio-stack](https://github.com/mihanic89/nextcloud-aio-stack)
+
 Скрипт для автоматического развёртывания на чистом сервере Debian/Ubuntu:
 
 1. **Docker Engine + Docker Compose plugin**
@@ -60,24 +62,16 @@ sudo bash setup-nextcloud-aio-stack.sh
 
 ## Запуск одной командой по ссылке на репозиторий
 
-После публикации на GitHub скрипт можно запускать сразу по ссылке, без ручного скачивания.
-
-Сначала получите «сырую» ссылку на файл: на странице `setup-nextcloud-aio-stack.sh` в репозитории нажмите **Raw** и скопируйте адрес из адресной строки — он вида:
-
-```
-https://raw.githubusercontent.com/<логин>/<репозиторий>/main/setup-nextcloud-aio-stack.sh
-```
-
-Дальше — на выбор:
+Скрипт можно запускать сразу по ссылке, без ручного скачивания:
 
 ```bash
 # Вариант 1 (рекомендуется): сначала скачать, посмотреть, потом запустить
-curl -fsSL https://raw.githubusercontent.com/<логин>/<репозиторий>/main/setup-nextcloud-aio-stack.sh -o setup.sh
+curl -fsSL https://raw.githubusercontent.com/mihanic89/nextcloud-aio-stack/main/setup-nextcloud-aio-stack.sh -o setup.sh
 less setup.sh   # по желанию — проверить содержимое перед запуском от root
 sudo bash setup.sh
 
 # Вариант 2: запуск одной командой, без сохранения на диск
-curl -fsSL https://raw.githubusercontent.com/<логин>/<репозиторий>/main/setup-nextcloud-aio-stack.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/mihanic89/nextcloud-aio-stack/main/setup-nextcloud-aio-stack.sh | sudo bash
 ```
 
 Скрипт сам определяет, что его stdin занят потоком curl, и переключает интерактивные вопросы (`read`) на терминал (`/dev/tty`) — так что вариант 2 тоже полностью интерактивен, вопросы будут заданы как обычно.
