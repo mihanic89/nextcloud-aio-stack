@@ -58,6 +58,17 @@ LOG_FILE="/var/log/nextcloud-aio-stack-install.log"
 NPM_IMAGE="${NPM_IMAGE:-jc21/nginx-proxy-manager:latest}"
 AIO_IMAGE="${AIO_IMAGE:-ghcr.io/nextcloud-releases/all-in-one:latest}"
 
+# WireGuard VPN (wg-easy)
+WG_CONTAINER_NAME="wg-easy"
+WG_IMAGE="${WG_IMAGE:-ghcr.io/wg-easy/wg-easy:15}"
+WG_NETWORK_NAME="wg-net"
+WG_IPV4_CIDR="10.8.0.0/24"
+WG_IPV6_CIDR="fd00:0:0:0::/64"
+
+# RustDesk (свой сервер удалённого доступа)
+RD_DATA_DIR="${STACK_DIR}/rustdesk/data"
+RD_IMAGE="${RD_IMAGE:-rustdesk/rustdesk-server:latest}"
+
 # ---------------------------------------------------------------------------
 # Вывод / логирование
 # ---------------------------------------------------------------------------
@@ -159,6 +170,50 @@ else
   log "Панель AIO будет доступна на https://<IP_сервера>:8080 — стандартная схема AIO (логин через пароль панели)."
 fi
 
+step "Дополнительные сервисы"
+
+read -r -p "Установить WireGuard VPN для безопасного удалённого доступа (через wg-easy)? [Y/n]: " INSTALL_WG
+INSTALL_WG="${INSTALL_WG,,}"
+if [[ "$INSTALL_WG" == "n" || "$INSTALL_WG" == "no" ]]; then INSTALL_WG="no"; else INSTALL_WG="yes"; fi
+
+if [[ "$INSTALL_WG" == "yes" ]]; then
+  read -r -p "Домен/поддомен для веб-панели WireGuard (например vpn.${NC_DOMAIN#*.}): " WG_DOMAIN
+  while [[ -z "$WG_DOMAIN" ]]; do
+    read -r -p "Домен обязателен для веб-панели WireGuard: " WG_DOMAIN
+  done
+  read -r -p "Имя администратора VPN-панели [admin]: " WG_ADMIN_USER
+  WG_ADMIN_USER="${WG_ADMIN_USER:-admin}"
+  while true; do
+    read -r -s -p "Пароль администратора VPN-панели (мин. 8 символов): " WG_ADMIN_PASSWORD
+    echo
+    read -r -s -p "Повторите пароль: " WG_ADMIN_PASSWORD_CONFIRM
+    echo
+    if [[ "$WG_ADMIN_PASSWORD" != "$WG_ADMIN_PASSWORD_CONFIRM" ]]; then
+      warn "Пароли не совпадают, попробуйте ещё раз"
+    elif [[ ${#WG_ADMIN_PASSWORD} -lt 8 ]]; then
+      warn "Слишком короткий пароль, нужно минимум 8 символов"
+    else
+      break
+    fi
+  done
+fi
+
+read -r -p "Установить RustDesk-сервер — свой удалённый доступ вместо TeamViewer/AnyDesk (hbbs+hbbr)? [Y/n]: " INSTALL_RD
+INSTALL_RD="${INSTALL_RD,,}"
+if [[ "$INSTALL_RD" == "n" || "$INSTALL_RD" == "no" ]]; then INSTALL_RD="no"; else INSTALL_RD="yes"; fi
+
+RD_VPN_ONLY="no"
+if [[ "$INSTALL_RD" == "yes" && "$INSTALL_WG" == "yes" ]]; then
+  log "RustDesk шифрует соединение собственным ключом и обычно держат его порты открытыми в интернет — это штатный режим его работы (так советует сам RustDesk, иначе хуже работает проброс соединения через NAT)."
+  read -r -p "Всё же ограничить порты RustDesk только VPN-подсетью (${WG_IPV4_CIDR}) через firewall? [y/N]: " RD_VPN_ONLY_IN
+  RD_VPN_ONLY_IN="${RD_VPN_ONLY_IN,,}"
+  if [[ "$RD_VPN_ONLY_IN" == "y" || "$RD_VPN_ONLY_IN" == "yes" ]]; then RD_VPN_ONLY="yes"; fi
+fi
+
+read -r -p "Установить Fail2ban для защиты SSH от перебора паролей? [Y/n]: " INSTALL_F2B
+INSTALL_F2B="${INSTALL_F2B,,}"
+if [[ "$INSTALL_F2B" == "n" || "$INSTALL_F2B" == "no" ]]; then INSTALL_F2B="no"; else INSTALL_F2B="yes"; fi
+
 step "Проверка DNS для $NC_DOMAIN"
 SERVER_IP="$(curl -fsS4 --max-time 5 https://ifconfig.me 2>/dev/null || curl -fsS4 --max-time 5 https://api.ipify.org 2>/dev/null || true)"
 DOMAIN_IP="$(dig +short A "$NC_DOMAIN" | tail -n1 || true)"
@@ -180,6 +235,9 @@ log "Итоговые параметры:"
 log "  Домен Nextcloud:        $NC_DOMAIN"
 log "  E-mail (LE / NPM):      $ADMIN_EMAIL"
 log "  Панель AIO слушает на:  ${AIO_BIND}:8080"
+log "  WireGuard VPN:          $([[ "$INSTALL_WG" == "yes" ]] && echo "да -> https://${WG_DOMAIN}" || echo "нет")"
+log "  RustDesk-сервер:        $([[ "$INSTALL_RD" == "yes" ]] && echo "да$([[ "$RD_VPN_ONLY" == "yes" ]] && echo " (только через VPN)")" || echo "нет")"
+log "  Fail2ban (SSH):         $([[ "$INSTALL_F2B" == "yes" ]] && echo "да" || echo "нет")"
 pause
 
 # ---------------------------------------------------------------------------
@@ -317,77 +375,85 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Универсальная функция: proxy host + Let's Encrypt сертификат через NPM API
+# ---------------------------------------------------------------------------
+# Аргументы: domain forward_host forward_port advanced_config state_prefix
+# Результат кладёт id хоста в ${STACK_DIR}/.npm_proxy_host_id_<state_prefix>
+npm_create_proxy_with_ssl() {
+  local domain="$1" fhost="$2" fport="$3" advanced="$4" prefix="$5"
+  local payload resp hostid cert_resp cert_id
+
+  if state_has "${prefix}_proxy_host_created"; then
+    ok "[$domain] proxy host уже был создан ранее, пропускаю"
+    return 0
+  fi
+
+  step "Создание proxy host для ${domain}"
+  payload="$(jq -n \
+    --arg domain "$domain" --arg host "$fhost" --argjson port "$fport" --arg advanced "$advanced" \
+    '{domain_names: [$domain], forward_scheme: "http", forward_host: $host, forward_port: $port,
+      block_exploits: true, allow_websocket_upgrade: true, caching_enabled: false,
+      advanced_config: $advanced, enabled: true}')"
+
+  resp="$(curl -fsS --max-time 15 -X POST "${NPM_API}/nginx/proxy-hosts" \
+    -H "Authorization: Bearer ${NPM_TOKEN}" -H 'Content-Type: application/json' \
+    -d "$payload" || true)"
+  hostid="$(echo "$resp" | jq -r '.id // empty')"
+
+  if [[ -z "$hostid" ]]; then
+    warn "Не удалось создать proxy host для $domain через API (ответ: $(echo "$resp" | head -c 300))"
+    warn "Создайте его вручную в UI: домен $domain -> forward host $fhost, порт $fport, схема http."
+    return 1
+  fi
+
+  ok "Proxy host создан (id=$hostid) -> $fhost:$fport"
+  state_set "${prefix}_proxy_host_created"
+  echo "$hostid" > "${STACK_DIR}/.npm_proxy_host_id_${prefix}"
+
+  step "Заказ сертификата Let's Encrypt для ${domain}"
+  cert_resp="$(curl -fsS --max-time 90 -X POST "${NPM_API}/nginx/certificates" \
+    -H "Authorization: Bearer ${NPM_TOKEN}" -H 'Content-Type: application/json' \
+    -d "$(jq -n --arg domain "$domain" --arg email "$ADMIN_EMAIL" \
+          '{provider:"letsencrypt", domain_names:[$domain],
+            meta:{dns_challenge:false, letsencrypt_email:$email, letsencrypt_agree:true}}')" || true)"
+  cert_id="$(echo "$cert_resp" | jq -r '.id // empty')"
+
+  if [[ -z "$cert_id" ]]; then
+    log "Повторная попытка с упрощённым телом запроса..."
+    cert_resp="$(curl -fsS --max-time 90 -X POST "${NPM_API}/nginx/certificates" \
+      -H "Authorization: Bearer ${NPM_TOKEN}" -H 'Content-Type: application/json' \
+      -d "$(jq -n --arg domain "$domain" '{provider:"letsencrypt", domain_names:[$domain], meta:{dns_challenge:false}}')" || true)"
+    cert_id="$(echo "$cert_resp" | jq -r '.id // empty')"
+  fi
+
+  if [[ -n "$cert_id" ]]; then
+    ok "Сертификат Let's Encrypt выпущен (id=$cert_id)"
+    curl -fsS --max-time 15 -X PUT "${NPM_API}/nginx/proxy-hosts/${hostid}" \
+      -H "Authorization: Bearer ${NPM_TOKEN}" -H 'Content-Type: application/json' \
+      -d "$(jq -n --argjson cert "$cert_id" \
+            '{certificate_id:$cert, ssl_forced:true, http2_support:true, hsts_enabled:true, hsts_subdomains:false}')" >/dev/null
+    ok "SSL включён для proxy host (Force SSL, HTTP/2, HSTS)"
+    state_set "${prefix}_cert_attached"
+  else
+    warn "Не удалось автоматически заказать сертификат для $domain (ответ API: $(echo "$cert_resp" | head -c 300))"
+    warn "Наиболее частая причина — DNS для $domain ещё не указывает на этот сервер, либо порт 80 закрыт файрволом."
+    warn "Закажите сертификат вручную в UI Nginx Proxy Manager (http://<IP>:81), когда DNS будет готов."
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # Proxy host + Let's Encrypt сертификат для Nextcloud
 # ---------------------------------------------------------------------------
-if [[ "$NPM_AUTOMATED" == "yes" ]] && ! state_has "npm_proxy_host_created"; then
-  step "Создание proxy host для ${NC_DOMAIN}"
-
-  ADVANCED_CONFIG='client_max_body_size 0;
+if [[ "$NPM_AUTOMATED" == "yes" ]]; then
+  NC_ADVANCED_CONFIG='client_max_body_size 0;
 proxy_read_timeout 3610s;
 proxy_send_timeout 3610s;
 proxy_set_header Host $host;
 proxy_set_header X-Real-IP $remote_addr;
 proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 proxy_set_header X-Forwarded-Proto $scheme;'
-
-  PROXY_HOST_PAYLOAD="$(jq -n \
-    --arg domain "$NC_DOMAIN" \
-    --arg host "$AIO_APACHE_CONTAINER" \
-    --argjson port "$APACHE_PORT" \
-    --arg advanced "$ADVANCED_CONFIG" \
-    '{domain_names: [$domain], forward_scheme: "http", forward_host: $host, forward_port: $port,
-      block_exploits: true, allow_websocket_upgrade: true, caching_enabled: false,
-      advanced_config: $advanced, enabled: true}')"
-
-  PROXY_HOST_RESP="$(curl -fsS --max-time 15 -X POST "${NPM_API}/nginx/proxy-hosts" \
-    -H "Authorization: Bearer ${NPM_TOKEN}" -H 'Content-Type: application/json' \
-    -d "$PROXY_HOST_PAYLOAD" || true)"
-
-  PROXY_HOST_ID="$(echo "$PROXY_HOST_RESP" | jq -r '.id // empty')"
-
-  if [[ -n "$PROXY_HOST_ID" ]]; then
-    ok "Proxy host создан (id=$PROXY_HOST_ID) -> $AIO_APACHE_CONTAINER:$APACHE_PORT"
-    state_set "npm_proxy_host_created"
-    echo "$PROXY_HOST_ID" > "${STACK_DIR}/.npm_proxy_host_id"
-
-    step "Заказ сертификата Let's Encrypt для ${NC_DOMAIN}"
-    CERT_PAYLOAD_FULL="$(jq -n --arg domain "$NC_DOMAIN" --arg email "$ADMIN_EMAIL" \
-      '{provider:"letsencrypt", domain_names:[$domain],
-        meta:{dns_challenge:false, letsencrypt_email:$email, letsencrypt_agree:true}}')"
-    CERT_RESP="$(curl -fsS --max-time 90 -X POST "${NPM_API}/nginx/certificates" \
-      -H "Authorization: Bearer ${NPM_TOKEN}" -H 'Content-Type: application/json' \
-      -d "$CERT_PAYLOAD_FULL" || true)"
-    CERT_ID="$(echo "$CERT_RESP" | jq -r '.id // empty')"
-
-    if [[ -z "$CERT_ID" ]]; then
-      log "Повторная попытка с упрощённым телом запроса..."
-      CERT_PAYLOAD_MIN="$(jq -n --arg domain "$NC_DOMAIN" \
-        '{provider:"letsencrypt", domain_names:[$domain], meta:{dns_challenge:false}}')"
-      CERT_RESP="$(curl -fsS --max-time 90 -X POST "${NPM_API}/nginx/certificates" \
-        -H "Authorization: Bearer ${NPM_TOKEN}" -H 'Content-Type: application/json' \
-        -d "$CERT_PAYLOAD_MIN" || true)"
-      CERT_ID="$(echo "$CERT_RESP" | jq -r '.id // empty')"
-    fi
-
-    if [[ -n "$CERT_ID" ]]; then
-      ok "Сертификат Let's Encrypt выпущен (id=$CERT_ID)"
-      curl -fsS --max-time 15 -X PUT "${NPM_API}/nginx/proxy-hosts/${PROXY_HOST_ID}" \
-        -H "Authorization: Bearer ${NPM_TOKEN}" -H 'Content-Type: application/json' \
-        -d "$(jq -n --argjson cert "$CERT_ID" \
-              '{certificate_id:$cert, ssl_forced:true, http2_support:true, hsts_enabled:true, hsts_subdomains:false}')" >/dev/null
-      ok "SSL включён для proxy host (Force SSL, HTTP/2, HSTS)"
-      state_set "npm_cert_attached"
-    else
-      warn "Не удалось автоматически заказать сертификат (ответ API: $(echo "$CERT_RESP" | head -c 300))"
-      warn "Наиболее частая причина — DNS для $NC_DOMAIN ещё не указывает на этот сервер, либо порт 80 закрыт файрволом."
-      warn "Закажите сертификат вручную в UI Nginx Proxy Manager (http://<IP>:81) для домена $NC_DOMAIN, когда DNS будет готов."
-    fi
-  else
-    warn "Не удалось создать proxy host через API (ответ: $(echo "$PROXY_HOST_RESP" | head -c 300))"
-    warn "Создайте его вручную в UI: домен $NC_DOMAIN -> forward host $AIO_APACHE_CONTAINER, порт $APACHE_PORT, схема http."
-  fi
-elif state_has "npm_proxy_host_created"; then
-  ok "Proxy host уже был создан ранее, пропускаю"
+  npm_create_proxy_with_ssl "$NC_DOMAIN" "$AIO_APACHE_CONTAINER" "$APACHE_PORT" "$NC_ADVANCED_CONFIG" "nc" || true
 fi
 
 # ---------------------------------------------------------------------------
@@ -495,8 +561,8 @@ if [[ "$NC_UP" == "yes" ]] && ! state_has "trusted_proxies_set"; then
 fi
 
 # Повторно убеждаемся, что proxy host в NPM смотрит на apache-контейнер
-if [[ "$NPM_AUTOMATED" == "yes" && "$APACHE_UP" == "yes" && -f "${STACK_DIR}/.npm_proxy_host_id" ]]; then
-  PROXY_HOST_ID="$(cat "${STACK_DIR}/.npm_proxy_host_id")"
+if [[ "$NPM_AUTOMATED" == "yes" && "$APACHE_UP" == "yes" && -f "${STACK_DIR}/.npm_proxy_host_id_nc" ]]; then
+  PROXY_HOST_ID="$(cat "${STACK_DIR}/.npm_proxy_host_id_nc")"
   NPM_TOKEN="$(npm_login "$ADMIN_EMAIL" "$NPM_ADMIN_PASSWORD" || true)"
   if [[ -n "$NPM_TOKEN" ]]; then
     curl -fsS --max-time 15 -X PUT "${NPM_API}/nginx/proxy-hosts/${PROXY_HOST_ID}" \
@@ -531,7 +597,150 @@ echo "и войдите под этими данными."
 echo "======================================================================"
 echo
 
+# ---------------------------------------------------------------------------
+# WireGuard VPN (wg-easy)
+# ---------------------------------------------------------------------------
+if [[ "$INSTALL_WG" == "yes" ]]; then
+  step "Развёртывание WireGuard VPN (wg-easy)"
+
+  if ! docker network inspect "$WG_NETWORK_NAME" >/dev/null 2>&1; then
+    docker network create --subnet "$WG_IPV4_CIDR" "$WG_NETWORK_NAME" >/dev/null
+    ok "Сеть $WG_NETWORK_NAME создана (подсеть $WG_IPV4_CIDR)"
+  fi
+
+  if docker inspect "$WG_CONTAINER_NAME" >/dev/null 2>&1; then
+    ok "Контейнер $WG_CONTAINER_NAME уже существует, пропускаю создание"
+  else
+    WG_PUBLIC_IP="${SERVER_IP:-}"
+    if [[ -z "$WG_PUBLIC_IP" ]]; then
+      WG_PUBLIC_IP="$(curl -fsS4 --max-time 5 https://ifconfig.me 2>/dev/null || curl -fsS4 --max-time 5 https://api.ipify.org 2>/dev/null || true)"
+    fi
+    if [[ -z "$WG_PUBLIC_IP" ]]; then
+      warn "Не удалось определить публичный IP сервера — в качестве адреса подключения клиентов будет указан $NC_DOMAIN."
+      WG_PUBLIC_IP="$NC_DOMAIN"
+    fi
+
+    docker run -d \
+      --name "$WG_CONTAINER_NAME" \
+      --restart unless-stopped \
+      --cap-add NET_ADMIN --cap-add SYS_MODULE \
+      --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+      --sysctl net.ipv4.ip_forward=1 \
+      --publish 51820:51820/udp \
+      --publish 51821:51821/tcp \
+      --network "$WG_NETWORK_NAME" \
+      --env INIT_ENABLED=true \
+      --env INIT_USERNAME="$WG_ADMIN_USER" \
+      --env INIT_PASSWORD="$WG_ADMIN_PASSWORD" \
+      --env INIT_HOST="$WG_PUBLIC_IP" \
+      --env INIT_PORT=51820 \
+      --env INIT_IPV4_CIDR="$WG_IPV4_CIDR" \
+      --env INIT_IPV6_CIDR="$WG_IPV6_CIDR" \
+      --volume wg_easy_data:/etc/wireguard \
+      "$WG_IMAGE" >/dev/null
+
+    ok "WireGuard (wg-easy) запущен, клиентам раздаётся подсеть $WG_IPV4_CIDR"
+  fi
+
+  # Подключаем wg-easy и к сети реверс-прокси, чтобы NPM мог проксировать его веб-панель по имени контейнера
+  docker network connect "$NETWORK_NAME" "$WG_CONTAINER_NAME" >/dev/null 2>&1 || true
+
+  log "Жду готовности веб-панели WireGuard..."
+  for i in $(seq 1 30); do
+    curl -fsS --max-time 3 "http://127.0.0.1:51821/" >/dev/null 2>&1 && break
+    sleep 2
+  done
+
+  if [[ "$NPM_AUTOMATED" == "yes" ]]; then
+    npm_create_proxy_with_ssl "$WG_DOMAIN" "$WG_CONTAINER_NAME" "51821" "" "wg" || true
+  else
+    warn "Настройте proxy host для $WG_DOMAIN -> $WG_CONTAINER_NAME:51821 (http) вручную в UI NPM."
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# RustDesk-сервер (hbbs + hbbr)
+# ---------------------------------------------------------------------------
+if [[ "$INSTALL_RD" == "yes" ]]; then
+  step "Развёртывание RustDesk-сервера (hbbs + hbbr)"
+  mkdir -p "$RD_DATA_DIR"
+
+  if docker inspect hbbs >/dev/null 2>&1; then
+    ok "Контейнеры RustDesk уже существуют, пропускаю создание"
+  else
+    # network_mode: host — официальная рекомендация RustDesk, иначе хуже работает
+    # проброс соединения через NAT (см. документацию rustdesk-server-oss).
+    docker run -d --name hbbr --restart unless-stopped --network host \
+      -v "${RD_DATA_DIR}:/root" "$RD_IMAGE" hbbr >/dev/null
+    docker run -d --name hbbs --restart unless-stopped --network host \
+      -v "${RD_DATA_DIR}:/root" "$RD_IMAGE" hbbs >/dev/null
+    ok "RustDesk-сервер запущен (hbbs+hbbr, порты 21115-21119 TCP и 21116 UDP)"
+  fi
+
+  log "Жду генерации ключа сервера..."
+  RD_PUBKEY=""
+  for i in $(seq 1 30); do
+    if [[ -f "${RD_DATA_DIR}/id_ed25519.pub" ]]; then
+      RD_PUBKEY="$(cat "${RD_DATA_DIR}/id_ed25519.pub")"
+      break
+    fi
+    sleep 2
+  done
+
+  if [[ "$RD_VPN_ONLY" == "yes" ]]; then
+    step "Ограничение доступа к RustDesk только из VPN-подсети ${WG_IPV4_CIDR}"
+    apt-get install -y -qq iptables-persistent >/dev/null 2>&1 || true
+    # Порядок важен: ACCEPT из VPN-подсети должен оказаться ВЫШЕ общего DROP.
+    iptables -C INPUT -p tcp --dport 21115:21119 -j DROP 2>/dev/null \
+      || iptables -I INPUT -p tcp --dport 21115:21119 -j DROP
+    iptables -C INPUT -p udp --dport 21116 -j DROP 2>/dev/null \
+      || iptables -I INPUT -p udp --dport 21116 -j DROP
+    iptables -C INPUT -p tcp --dport 21115:21119 -s "$WG_IPV4_CIDR" -j ACCEPT 2>/dev/null \
+      || iptables -I INPUT -p tcp --dport 21115:21119 -s "$WG_IPV4_CIDR" -j ACCEPT
+    iptables -C INPUT -p udp --dport 21116 -s "$WG_IPV4_CIDR" -j ACCEPT 2>/dev/null \
+      || iptables -I INPUT -p udp --dport 21116 -s "$WG_IPV4_CIDR" -j ACCEPT
+    netfilter-persistent save >/dev/null 2>&1 || true
+    ok "Порты RustDesk теперь принимают подключения только из подсети VPN ($WG_IPV4_CIDR)"
+    warn "Подключиться к RustDesk теперь можно только после подключения к WireGuard VPN."
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Fail2ban
+# ---------------------------------------------------------------------------
+if [[ "$INSTALL_F2B" == "yes" ]]; then
+  step "Установка и настройка Fail2ban (защита SSH)"
+  apt-get install -y -qq fail2ban >/dev/null
+  cat > /etc/fail2ban/jail.local <<'EOF'
+[DEFAULT]
+bantime  = 1h
+findtime = 10m
+maxretry = 5
+
+[sshd]
+enabled  = true
+backend  = systemd
+EOF
+  systemctl enable --now fail2ban >/dev/null 2>&1 || true
+  systemctl restart fail2ban
+  ok "Fail2ban установлен и защищает SSH (5 неверных попыток за 10 минут -> бан на 1 час)"
+  warn "Веб-панели (NPM/AIO/WireGuard) Fail2ban НЕ защищает: их логи внутри Docker-контейнеров, а блокировка"
+  warn "Docker-портов требует отдельной настройки цепочки DOCKER-USER. Основная защита для них — длинные"
+  warn "пароли (уже заданы) и, при желании, перевод этих панелей на доступ только через VPN."
+fi
+
+echo
 ok "Установка инфраструктуры завершена."
 log "Логи установки сохранены в $LOG_FILE"
 log "Docker-compose Nginx Proxy Manager: $NPM_COMPOSE_FILE"
 log "Панель Nginx Proxy Manager: http://<IP_сервера>:81  (логин: $ADMIN_EMAIL)"
+if [[ "$INSTALL_WG" == "yes" ]]; then
+  log "WireGuard VPN панель: https://${WG_DOMAIN}  (логин: $WG_ADMIN_USER)"
+fi
+if [[ "$INSTALL_RD" == "yes" ]]; then
+  log "RustDesk-сервер: ID-адрес сервера = IP этого сервера; публичный ключ для клиентов:"
+  log "  ${RD_PUBKEY:-<не успел сгенерироваться, проверьте ${RD_DATA_DIR}/id_ed25519.pub>}"
+fi
+if [[ "$INSTALL_F2B" == "yes" ]]; then
+  log "Fail2ban активен для SSH (проверить: fail2ban-client status sshd)"
+fi
