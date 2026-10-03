@@ -10,6 +10,7 @@
 4. (опционально) **[WireGuard VPN](https://github.com/wg-easy/wg-easy)** — для безопасного удалённого доступа к инфраструктуре
 5. (опционально) **[RustDesk-сервер](https://github.com/rustdesk/rustdesk-server)** (hbbs+hbbr) — свой сервер удалённого доступа вместо TeamViewer/AnyDesk
 6. (опционально) **Fail2ban** — защита SSH от перебора паролей
+7. (опционально) **[SuiteCRM](https://suitecrm.com/)** — CRM, собирается из официального релизного архива (своего Docker-образа у SuiteCRM нет)
 
 ## Важно: что скрипт НЕ может автоматизировать
 
@@ -39,7 +40,7 @@ sudo bash setup-nextcloud-aio-stack.sh
 - e-mail для Let's Encrypt и учётной записи администратора Nginx Proxy Manager;
 - пароль администратора Nginx Proxy Manager;
 - ограничить ли панель Nextcloud AIO (порт 8080) только localhost вместо доступа извне (по умолчанию — доступ извне открыт, как в стандартной установке AIO; ограничение до localhost — опциональное усиление, доступ тогда только через SSH-туннель);
-- устанавливать ли WireGuard VPN, RustDesk-сервер и Fail2ban (см. раздел ниже) — для каждого отдельный вопрос.
+- устанавливать ли WireGuard VPN, RustDesk-сервер, Fail2ban и SuiteCRM (см. раздел ниже) — для каждого отдельный вопрос.
 
 Скрипт идемпотентен — его можно безопасно перезапускать, уже выполненные шаги он пропускает (состояние хранится в `/opt/nextcloud-stack/.install-state`).
 
@@ -58,7 +59,7 @@ sudo bash setup-nextcloud-aio-stack.sh
    - нажмёте «Save and start containers»
 9. Скрипт дожидается поднятия контейнеров Apache и Nextcloud и сам прописывает `trusted_proxies`
 10. Показывает, где Nextcloud AIO выведет сгенерированный логин/пароль первого администратора
-11. (если выбрано) Поднимает WireGuard VPN, RustDesk-сервер и/или Fail2ban — см. «Опциональные сервисы» ниже
+11. (если выбрано) Поднимает WireGuard VPN, RustDesk-сервер, Fail2ban и/или SuiteCRM — см. «Опциональные сервисы» ниже
 
 ## Запуск одной командой по ссылке на репозиторий
 
@@ -97,6 +98,22 @@ curl -fsSL https://raw.githubusercontent.com/mihanic89/nextcloud-aio-stack/main/
 ### Fail2ban
 
 Защищает только SSH (бэкенд `systemd`, бан на 1 час после 5 неудачных попыток за 10 минут). Веб-панели (NPM, AIO, WireGuard) Fail2ban **не защищает** — их логи находятся внутри Docker-контейнеров, а блокировка Docker-проксируемых портов требует отдельной настройки цепочки `DOCKER-USER` в iptables, которая не входит в этот скрипт. Основная защита для панелей — длинные пароли (скрипт требует минимум 8 символов) и, при желании, перевод их на доступ только через VPN.
+
+### SuiteCRM
+
+У SuiteCRM нет официального Docker-образа, поэтому это самая нестандартная (по сравнению с остальным скриптом, который везде использует официальные образы/переменные) часть установки: скрипт сам собирает образ по кастомному `Dockerfile` на базе `php:8.2-apache`, скачивая официальный релизный архив `SuiteCRM-Core` (по умолчанию версия `8.10.2`, переопределяется переменной `SUITE_VERSION`) с [github.com/SuiteCRM/SuiteCRM-Core/releases](https://github.com/SuiteCRM/SuiteCRM-Core/releases) — этот архив уже содержит собранный фронтенд и зависимости, отдельная сборка на Node/Yarn/Composer не нужна. Поднимается вместе с MariaDB, установка выполняется официальной неинтерактивной CLI-командой `bin/console suitecrm:app:install` с логином/паролем администратора, которые вы вводите в этом же скрипте. Публикуется через тот же NPM + Let's Encrypt.
+
+**Русский язык интерфейса не ставится автоматически** — у официального CLI-установщика SuiteCRM нет флага/переменной для выбора языка. После установки это нужно сделать один раз руками:
+
+1. Скачать `rapira-suite_pack_russian.zip` со страницы [github.com/likhobory/SuiteCRM-CoreRU](https://github.com/likhobory/SuiteCRM-CoreRU) (Releases) — пакет специально под SuiteCRM 8;
+2. Войти в SuiteCRM под администратором → **Administration → Module Loader**;
+3. Загрузить (Upload) и установить (Install) пакет;
+4. **Administration → Repair → Quick Repair and Rebuild**;
+5. Выйти и на экране входа выбрать русский язык.
+
+(Для SuiteCRM 7.x такой же пакет есть в [github.com/likhobory/SuiteCRM7RU](https://github.com/likhobory/SuiteCRM7RU) — этот скрипт разворачивает только SuiteCRM 8.)
+
+Пароли базы данных генерируются случайно и хранятся только в `${STACK_DIR}/suitecrm/docker-compose.yml` (права доступа `600`) — для входа в саму CRM они не нужны, только для её внутреннего подключения к MariaDB.
 
 ## Настройка под себя
 

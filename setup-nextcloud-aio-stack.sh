@@ -69,6 +69,16 @@ WG_IPV6_CIDR="fd00:0:0:0::/64"
 RD_DATA_DIR="${STACK_DIR}/rustdesk/data"
 RD_IMAGE="${RD_IMAGE:-rustdesk/rustdesk-server:latest}"
 
+# SuiteCRM (нет официального Docker-образа — собирается из официального
+# релизного архива SuiteCRM-Core в кастомном Dockerfile)
+SUITE_DIR="${STACK_DIR}/suitecrm"
+SUITE_COMPOSE_FILE="${SUITE_DIR}/docker-compose.yml"
+SUITE_DOCKERFILE="${SUITE_DIR}/Dockerfile"
+SUITE_CONTAINER="suitecrm"
+SUITE_DB_CONTAINER="suitecrm-db"
+SUITE_VERSION="${SUITE_VERSION:-8.10.2}"
+SUITE_DB_IMAGE="${SUITE_DB_IMAGE:-mariadb:latest}"
+
 # ---------------------------------------------------------------------------
 # Вывод / логирование
 # ---------------------------------------------------------------------------
@@ -214,6 +224,35 @@ read -r -p "Установить Fail2ban для защиты SSH от пере�
 INSTALL_F2B="${INSTALL_F2B,,}"
 if [[ "$INSTALL_F2B" == "n" || "$INSTALL_F2B" == "no" ]]; then INSTALL_F2B="no"; else INSTALL_F2B="yes"; fi
 
+read -r -p "Установить SuiteCRM? [Y/n]: " INSTALL_SUITE
+INSTALL_SUITE="${INSTALL_SUITE,,}"
+if [[ "$INSTALL_SUITE" == "n" || "$INSTALL_SUITE" == "no" ]]; then INSTALL_SUITE="no"; else INSTALL_SUITE="yes"; fi
+
+if [[ "$INSTALL_SUITE" == "yes" ]]; then
+  log "У SuiteCRM нет официального Docker-образа — скрипт соберёт его из официального релизного"
+  log "архива SuiteCRM-Core (v${SUITE_VERSION}). Русский язык интерфейса придётся один раз"
+  log "установить вручную через Module Loader после установки (см. README)."
+  read -r -p "Домен/поддомен для SuiteCRM (например crm.${NC_DOMAIN#*.}): " SUITE_DOMAIN
+  while [[ -z "$SUITE_DOMAIN" ]]; do
+    read -r -p "Домен обязателен для SuiteCRM: " SUITE_DOMAIN
+  done
+  read -r -p "Имя администратора SuiteCRM [admin]: " SUITE_ADMIN_USERNAME
+  SUITE_ADMIN_USERNAME="${SUITE_ADMIN_USERNAME:-admin}"
+  while true; do
+    read -r -s -p "Пароль администратора SuiteCRM (мин. 8 символов): " SUITE_ADMIN_PASSWORD
+    echo
+    read -r -s -p "Повторите пароль: " SUITE_ADMIN_PASSWORD_CONFIRM
+    echo
+    if [[ "$SUITE_ADMIN_PASSWORD" != "$SUITE_ADMIN_PASSWORD_CONFIRM" ]]; then
+      warn "Пароли не совпадают, попробуйте ещё раз"
+    elif [[ ${#SUITE_ADMIN_PASSWORD} -lt 8 ]]; then
+      warn "Слишком короткий пароль, нужно минимум 8 символов"
+    else
+      break
+    fi
+  done
+fi
+
 step "Проверка DNS для $NC_DOMAIN"
 SERVER_IP="$(curl -fsS4 --max-time 5 https://ifconfig.me 2>/dev/null || curl -fsS4 --max-time 5 https://api.ipify.org 2>/dev/null || true)"
 DOMAIN_IP="$(dig +short A "$NC_DOMAIN" | tail -n1 || true)"
@@ -238,6 +277,7 @@ log "  Панель AIO слушает на:  ${AIO_BIND}:8080"
 log "  WireGuard VPN:          $([[ "$INSTALL_WG" == "yes" ]] && echo "да -> https://${WG_DOMAIN}" || echo "нет")"
 log "  RustDesk-сервер:        $([[ "$INSTALL_RD" == "yes" ]] && echo "да$([[ "$RD_VPN_ONLY" == "yes" ]] && echo " (только через VPN)")" || echo "нет")"
 log "  Fail2ban (SSH):         $([[ "$INSTALL_F2B" == "yes" ]] && echo "да" || echo "нет")"
+log "  SuiteCRM:               $([[ "$INSTALL_SUITE" == "yes" ]] && echo "да -> https://${SUITE_DOMAIN}" || echo "нет")"
 pause
 
 # ---------------------------------------------------------------------------
@@ -729,6 +769,150 @@ EOF
   warn "пароли (уже заданы) и, при желании, перевод этих панелей на доступ только через VPN."
 fi
 
+# ---------------------------------------------------------------------------
+# SuiteCRM
+# ---------------------------------------------------------------------------
+if [[ "$INSTALL_SUITE" == "yes" ]]; then
+  step "Развёртывание SuiteCRM"
+  mkdir -p "$SUITE_DIR"
+
+  if [[ ! -f "$SUITE_DOCKERFILE" ]]; then
+    cat > "$SUITE_DOCKERFILE" <<EOF
+FROM php:8.2-apache
+
+RUN apt-get update \\
+ && apt-get install -y --no-install-recommends \\
+      unzip libzip-dev libpng-dev libjpeg-dev libfreetype6-dev libxml2-dev \\
+      libldap2-dev libicu-dev libonig-dev \\
+ && docker-php-ext-configure gd --with-freetype --with-jpeg \\
+ && docker-php-ext-configure ldap \\
+ && docker-php-ext-install -j"\$(nproc)" \\
+      zip gd pdo_mysql mysqli xml ldap intl mbstring soap opcache bcmath exif \\
+ && a2enmod rewrite headers expires \\
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /tmp
+RUN curl -fsSL -o suitecrm.zip \\
+      "https://github.com/SuiteCRM/SuiteCRM-Core/releases/download/v${SUITE_VERSION}/SuiteCRM-${SUITE_VERSION}.zip" \\
+ && rm -rf /var/www/html/* \\
+ && unzip -q suitecrm.zip -d /tmp/suite-extract \\
+ && SRC_DIR="\$(find /tmp/suite-extract -mindepth 1 -maxdepth 1 -type d | head -n1)" \\
+ && if [[ -z "\$SRC_DIR" ]]; then SRC_DIR="/tmp/suite-extract"; fi \\
+ && cp -a "\$SRC_DIR"/. /var/www/html/ \\
+ && rm -rf /tmp/suitecrm.zip /tmp/suite-extract
+
+WORKDIR /var/www/html
+RUN find . -type d -exec chmod 2755 {} \\; \\
+ && find . -type f -exec chmod 0644 {} \\; \\
+ && chmod +x bin/console \\
+ && chown -R www-data:www-data /var/www/html
+
+ENV APACHE_DOCUMENT_ROOT=/var/www/html/public
+RUN sed -ri -e 's!/var/www/html!\${APACHE_DOCUMENT_ROOT}!g' /etc/apache2/sites-available/*.conf \\
+ && sed -ri -e 's!/var/www/!\${APACHE_DOCUMENT_ROOT}!g' /etc/apache2/apache2.conf /etc/apache2/conf-available/*.conf
+EOF
+    ok "Dockerfile для SuiteCRM создан ($SUITE_DOCKERFILE, версия ${SUITE_VERSION})"
+  else
+    ok "Dockerfile для SuiteCRM уже существует, использую его"
+  fi
+
+  if [[ ! -f "$SUITE_COMPOSE_FILE" ]]; then
+    SUITE_DB_ROOT_PASSWORD="$(openssl rand -hex 16)"
+    SUITE_DB_PASSWORD="$(openssl rand -hex 16)"
+
+    cat > "$SUITE_COMPOSE_FILE" <<EOF
+services:
+  ${SUITE_DB_CONTAINER}:
+    image: ${SUITE_DB_IMAGE}
+    container_name: ${SUITE_DB_CONTAINER}
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: "${SUITE_DB_ROOT_PASSWORD}"
+      MARIADB_DATABASE: suitecrm
+      MARIADB_USER: suitecrm
+      MARIADB_PASSWORD: "${SUITE_DB_PASSWORD}"
+    volumes:
+      - suitecrm_db:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 20s
+      start_period: 10s
+      timeout: 10s
+      retries: 5
+    networks:
+      - ${NETWORK_NAME}
+
+  ${SUITE_CONTAINER}:
+    build: .
+    container_name: ${SUITE_CONTAINER}
+    restart: unless-stopped
+    volumes:
+      - suitecrm_data:/var/www/html
+    depends_on:
+      ${SUITE_DB_CONTAINER}:
+        condition: service_healthy
+    networks:
+      - ${NETWORK_NAME}
+
+networks:
+  ${NETWORK_NAME}:
+    external: true
+
+volumes:
+  suitecrm_data:
+  suitecrm_db:
+EOF
+    chmod 600 "$SUITE_COMPOSE_FILE"
+    ok "docker-compose.yml для SuiteCRM создан ($SUITE_COMPOSE_FILE, пароли БД сгенерированы случайно)"
+  else
+    ok "docker-compose.yml для SuiteCRM уже существует, использую его"
+  fi
+
+  log "Собираю образ SuiteCRM (сборка из официального релизного архива, может занять несколько минут)..."
+  (cd "$SUITE_DIR" && docker compose build && docker compose up -d)
+  ok "Контейнеры SuiteCRM запущены"
+
+  log "Жду готовности SuiteCRM (bin/console внутри контейнера)..."
+  for i in $(seq 1 60); do
+    docker exec "$SUITE_CONTAINER" test -x /var/www/html/bin/console >/dev/null 2>&1 && break
+    sleep 5
+  done
+
+  if ! state_has "suite_installed"; then
+    step "Установка SuiteCRM (bin/console suitecrm:app:install)"
+    if docker exec "$SUITE_CONTAINER" php bin/console suitecrm:app:install \
+        -U suitecrm -P "${SUITE_DB_PASSWORD:-}" -H "$SUITE_DB_CONTAINER" -N suitecrm \
+        -u "$SUITE_ADMIN_USERNAME" -p "$SUITE_ADMIN_PASSWORD" \
+        -S "https://${SUITE_DOMAIN}/" -d no --no-interaction; then
+      ok "SuiteCRM установлен"
+      state_set "suite_installed"
+    else
+      warn "Автоматическая установка SuiteCRM не удалась. Повторите вручную:"
+      warn "  docker exec -it $SUITE_CONTAINER php bin/console suitecrm:app:install ..."
+    fi
+  else
+    ok "SuiteCRM уже был установлен ранее, пропускаю"
+  fi
+
+  if [[ "$NPM_AUTOMATED" == "yes" ]]; then
+    SUITE_ADVANCED_CONFIG='client_max_body_size 0;
+proxy_set_header Host $host;
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto $scheme;'
+    npm_create_proxy_with_ssl "$SUITE_DOMAIN" "$SUITE_CONTAINER" "80" "$SUITE_ADVANCED_CONFIG" "suite" || true
+  else
+    warn "Настройте proxy host для $SUITE_DOMAIN -> $SUITE_CONTAINER:80 (http) вручную в UI NPM."
+  fi
+
+  log "Русский язык интерфейса НЕ входит в официальную установку SuiteCRM 8 и ставится один раз вручную:"
+  log "  1. Скачайте rapira-suite_pack_russian.zip с github.com/likhobory/SuiteCRM-CoreRU (Releases)"
+  log "  2. Войдите в SuiteCRM под admin -> Administration -> Module Loader"
+  log "  3. Загрузите (Upload) и установите (Install) пакет"
+  log "  4. Administration -> Repair -> Quick Repair and Rebuild"
+  log "  5. Выйдите и выберите русский язык на экране входа"
+fi
+
 echo
 ok "Установка инфраструктуры завершена."
 log "Логи установки сохранены в $LOG_FILE"
@@ -743,4 +927,8 @@ if [[ "$INSTALL_RD" == "yes" ]]; then
 fi
 if [[ "$INSTALL_F2B" == "yes" ]]; then
   log "Fail2ban активен для SSH (проверить: fail2ban-client status sshd)"
+fi
+if [[ "$INSTALL_SUITE" == "yes" ]]; then
+  log "SuiteCRM: https://${SUITE_DOMAIN}  (логин: $SUITE_ADMIN_USERNAME)"
+  log "  Русский язык ставится вручную через Module Loader, см. вывод установки SuiteCRM выше."
 fi
